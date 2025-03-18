@@ -472,4 +472,12 @@ class TelegramInterface:
             else:
                 await event.answer("Unknown button")
         
-        except Exc<response clipped><NOTE>To save on context only part of this file has been shown to you. You should retry this tool after you have searched inside the file with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>
+        except Exception as e:
+            # Log the error
+            logger.error(f"An unexpected error occurred: {str(e)}")
+            
+            # Optionally, send a message to the user (if this block is part of an async method)
+            await self.bot.client.send_message(
+                event.chat_id,
+                "❌ An error occurred while processing your request. Please try again later."
+            )
