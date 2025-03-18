@@ -1,443 +1,688 @@
 """
-Bot client for Telegram integration.
-This module handles command processing and notifications using a bot account.
+Telegram bot client for Solana Trading Bot.
+This module handles the bot client functionality.
 """
 import asyncio
-import os
-import time
-from typing import Dict, List, Optional, Callable
+import re
+from typing import Callable, Dict, List, Optional, Union
 from telethon import TelegramClient, events, Button
 from telethon.tl.types import User
 from loguru import logger
 
-from telegram.client_factory import TelegramClientFactory
+from utils.telegram_error_handler import TelegramErrorHandler
 
 class BotClient:
     """
-    Bot client for Telegram integration.
-    Uses a bot account to handle commands and send notifications.
+    Telegram bot client for handling commands and sending notifications.
+    Uses the Telethon library with a bot token.
     """
     
-    def __init__(self, token: str, admin_id: int):
+    def __init__(
+        self,
+        token: str,
+        admin_id: int,
+        user_client = None
+    ):
         """
         Initialize the bot client.
         
         Args:
             token: Bot token from BotFather
             admin_id: Telegram user ID of the admin
+            user_client: User client instance for group operations
         """
         self.token = token
         self.admin_id = admin_id
-        self.client = None
-        self.session_string = None
+        self.user_client = user_client
+        self.client = TelegramClient('bot_session', api_id=123456, api_hash='dummy')
+        self.client.parse_mode = 'markdown'
+        
+        # Set bot token
+        self.client.session.set_dc(2, '149.154.167.40', 443)
+        self.client._bot_token = token
+        
+        # Command handlers
+        self.command_handlers = {}
+        self.button_callback = None
+        
+        # Trading component
         self.trader = None
-        self.running = False
         
-        # Session file path
-        self.session_file = os.path.join(
-            os.path.dirname(os.path.dirname(__file__)),
-            "config",
-            "bot_session.txt"
-        )
-        
-        # Store detected tokens
-        self.detected_tokens = {}
+        # Register default handlers
+        self._register_default_handlers()
         
         logger.info("Bot client initialized")
     
     async def start(self):
-        """Start the bot client and connect to Telegram."""
-        logger.info("Starting bot client...")
-        
-        # Load session if exists
-        self.session_string = TelegramClientFactory.load_session(self.session_file)
-        
-        # Create client
-        self.client, self.session_string = await TelegramClientFactory.create_bot_client(
-            token=self.token,
-            session_string=self.session_string
-        )
-        
-        # Save session
-        TelegramClientFactory.save_session(self.session_string, self.session_file)
-        
-        # Setup command handlers
-        self.client.add_event_handler(
-            self._start_command,
-            events.NewMessage(pattern='/start')
-        )
-        
-        self.client.add_event_handler(
-            self._help_command,
-            events.NewMessage(pattern='/help')
-        )
-        
-        self.client.add_event_handler(
-            self._status_command,
-            events.NewMessage(pattern='/status')
-        )
-        
-        self.client.add_event_handler(
-            self._settings_command,
-            events.NewMessage(pattern='/settings')
-        )
-        
-        self.client.add_event_handler(
-            self._toggle_autotrade_command,
-            events.NewMessage(pattern='/toggle_autotrade')
-        )
-        
-        self.client.add_event_handler(
-            self._set_buy_amount_command,
-            events.NewMessage(pattern='/set_buy_amount')
-        )
-        
-        self.client.add_event_handler(
-            self._set_target_multiplier_command,
-            events.NewMessage(pattern='/set_target_multiplier')
-        )
-        
-        self.client.add_event_handler(
-            self._set_sell_percentage_command,
-            events.NewMessage(pattern='/set_sell_percentage')
-        )
-        
-        # Setup callback query handler for buttons
-        self.client.add_event_handler(
-            self._button_callback,
-            events.CallbackQuery()
-        )
-        
-        logger.info("Bot client started successfully")
-        
-        # Get bot info for logging
+        """Start the bot client."""
+        await self.client.start(bot_token=self.token)
         me = await self.client.get_me()
-        logger.info(f"Bot logged in as: {me.first_name} (@{me.username})")
-        
-        # Send startup notification to admin
-        try:
-            await self.client.send_message(
-                self.admin_id,
-                "🤖 Solana Trading Bot is now online!"
-            )
-        except Exception as e:
-            logger.error(f"Failed to send startup notification: {str(e)}")
+        logger.info(f"Bot started as @{me.username}")
     
     async def stop(self):
-        """Stop the bot client and disconnect from Telegram."""
-        logger.info("Stopping bot client...")
+        """Stop the bot client."""
         await self.client.disconnect()
-        logger.info("Bot client stopped successfully")
+        logger.info("Bot client stopped")
     
     async def run(self):
-        """Run the bot client in a loop."""
-        self.running = True
-        logger.info("Bot client is now running")
-        
-        while self.running:
+        """Run the bot client indefinitely."""
+        logger.info("Bot client running...")
+        while True:
             await asyncio.sleep(1)
     
     def set_trader(self, trader):
         """
-        Set the trader instance for executing trades.
+        Set the trader component.
         
         Args:
-            trader: SolanaTrader instance
+            trader: Trader component
         """
         self.trader = trader
-        logger.info("Trader set for bot client")
+        logger.info("Trader component set")
     
-    async def send_token_notification(self, token_info: Dict):
+    def register_command_handler(self, command: str, handler: Callable):
         """
-        Send notification about a detected token.
+        Register a command handler.
         
         Args:
-            token_info: Dictionary containing token information
+            command: Command name without slash
+            handler: Handler function
         """
-        if not token_info.get('symbol'):
-            logger.warning("Received token notification without symbol")
+        self.command_handlers[command] = handler
+        logger.info(f"Registered handler for /{command}")
+    
+    def register_button_callback(self, callback: Callable):
+        """
+        Register a button callback handler.
+        
+        Args:
+            callback: Callback function
+        """
+        self.button_callback = callback
+        logger.info("Registered button callback handler")
+    
+    def _register_default_handlers(self):
+        """Register default command handlers."""
+        # Register command handler
+        @self.client.on(events.NewMessage(pattern=r'/[a-zA-Z0-9_]+'))
+        async def handle_command(event):
+            """Handle bot commands."""
+            # Extract command
+            command = event.raw_text.split()[0][1:]
+            
+            # Check if handler exists
+            if command in self.command_handlers:
+                try:
+                    await self.command_handlers[command](event)
+                except Exception as e:
+                    logger.error(f"Error handling command /{command}: {str(e)}")
+                    await event.respond(f"❌ Error executing command: {str(e)}")
+            else:
+                await event.respond(f"❌ Unknown command: /{command}")
+        
+        # Register button callback handler
+        @self.client.on(events.CallbackQuery())
+        async def handle_button(event):
+            """Handle button callbacks."""
+            if self.button_callback:
+                try:
+                    await self.button_callback(event)
+                except Exception as e:
+                    logger.error(f"Error handling button callback: {str(e)}")
+                    await event.answer(f"Error: {str(e)}", alert=True)
+            else:
+                await event.answer("No button handler registered", alert=True)
+    
+    @TelegramErrorHandler.handle_telegram_errors
+    async def send_message(
+        self,
+        user_id: int,
+        text: str,
+        buttons: Optional[List] = None,
+        link_preview: bool = False
+    ):
+        """
+        Send a message to a user.
+        
+        Args:
+            user_id: Telegram user ID
+            text: Message text
+            buttons: Optional buttons
+            link_preview: Whether to show link preview
+        
+        Returns:
+            Sent message
+        """
+        return await self.client.send_message(
+            user_id,
+            text,
+            buttons=buttons,
+            link_preview=link_preview
+        )
+    
+    @TelegramErrorHandler.handle_telegram_errors
+    async def send_token_notification(self, token_data: Dict):
+        """
+        Send a notification about a detected token.
+        
+        Args:
+            token_data: Token data
+        """
+        symbol = token_data.get("symbol", "Unknown")
+        address = token_data.get("address")
+        price = token_data.get("price")
+        source = token_data.get("source", "Unknown")
+        
+        if not address:
+            logger.warning(f"No address for token {symbol}, skipping notification")
             return
-        
-        symbol = token_info['symbol']
-        address = token_info.get('address', 'Unknown')
-        source = token_info.get('source', 'Unknown')
-        
-        # Skip if we've already notified about this token recently
-        if symbol in self.detected_tokens:
-            logger.info(f"Token {symbol} already notified recently, skipping")
-            return
-        
-        # Store token for deduplication
-        self.detected_tokens[symbol] = {
-            'address': address,
-            'source': source,
-            'timestamp': asyncio.get_event_loop().time()
-        }
-        
-        # Clean up old tokens (older than 1 hour)
-        current_time = asyncio.get_event_loop().time()
-        self.detected_tokens = {
-            k: v for k, v in self.detected_tokens.items()
-            if current_time - v['timestamp'] < 3600
-        }
         
         # Create notification message
-        message = f"🚨 **New Token Detected** 🚨\n\n"
-        message += f"**Symbol:** {symbol}\n"
-        message += f"**Address:** {address}\n"
-        message += f"**Source:** {source}\n\n"
+        message = (
+            f"🔔 **New Token Detected!**\n\n"
+            f"🔹 Symbol: **{symbol}**\n"
+            f"🔹 Address: `{address}`\n"
+        )
         
-        if token_info.get('price'):
-            message += f"**Price:** ${token_info['price']}\n\n"
+        if price:
+            message += f"🔹 Price: **{price}**\n"
         
-        if token_info.get('message'):
-            # Truncate message if too long
-            orig_message = token_info['message']
-            if len(orig_message) > 200:
-                orig_message = orig_message[:197] + "..."
-            message += f"**Original Message:**\n{orig_message}\n\n"
+        message += f"🔹 Source: **{source}**\n\n"
+        
+        # Add auto-trade status
+        if self.trader and self.trader.auto_trade_enabled:
+            message += "🤖 Auto-trading is enabled. Trading this token automatically."
+            
+            # Auto-trade the token
+            asyncio.create_task(self.trader.buy_token(symbol, address))
+        else:
+            message += "🤖 Auto-trading is disabled. Click the button below to trade this token."
         
         # Add buttons
         buttons = [
-            [Button.inline("🚀 Auto-Trade", data=f"trade_{symbol}_{address}")],
-            [Button.inline("🔍 View on Jupiter", data=f"view_{symbol}_{address}")]
+            [Button.inline(f"Trade {symbol}", data=f"trade_{symbol}_{address}")]
         ]
         
-        try:
-            # Send notification to admin
-            await self.client.send_message(
-                self.admin_id,
-                message,
-                buttons=buttons
-            )
-            logger.info(f"Sent token notification for {symbol} to admin")
-        except Exception as e:
-            logger.error(f"Failed to send token notification: {str(e)}")
-    
-    async def _start_command(self, event):
-        """Handle /start command."""
-        user = await event.get_sender()
-        
-        # Only respond to admin
-        if user.id != self.admin_id:
-            return
-        
-        welcome_message = (
-            "👋 **Welcome to Solana Trading Bot!**\n\n"
-            "This bot monitors Telegram groups and jup.ag/trenches for new Solana tokens "
-            "and can automatically trade them based on your settings.\n\n"
-            "Use /help to see available commands."
+        # Send notification to admin
+        await self.send_message(
+            self.admin_id,
+            message,
+            buttons=buttons
         )
         
-        await event.respond(welcome_message)
-        logger.info(f"Sent welcome message to user {user.id}")
+        logger.info(f"Sent notification for token {symbol}")
     
-    async def _help_command(self, event):
-        """Handle /help command."""
-        user = await event.get_sender()
+    async def handle_start(self, event):
+        """
+        Handle /start command.
         
-        # Only respond to admin
-        if user.id != self.admin_id:
-            return
+        Args:
+            event: Telegram event
+        """
+        welcome_message = (
+            "🤖 **Welcome to Solana Trading Bot!**\n\n"
+            "This bot monitors Telegram groups and jup.ag/trenches for new Solana tokens "
+            "and can automatically trade them.\n\n"
+            "**Commands:**\n"
+            "/help - Show available commands\n"
+            "/status - Show bot status\n"
+            "/settings - Show current settings\n"
+            "/trades - Show active trades\n"
+            "/enable - Enable auto-trading\n"
+            "/disable - Disable auto-trading\n"
+            "/setbuy <amount> - Set buy amount in SOL\n"
+            "/settarget <multiplier> - Set target profit multiplier\n"
+            "/setsell <percentage> - Set sell percentage at target"
+        )
         
+        await self.send_message(
+            event.chat_id,
+            welcome_message
+        )
+    
+    async def handle_help(self, event):
+        """
+        Handle /help command.
+        
+        Args:
+            event: Telegram event
+        """
         help_message = (
             "📚 **Available Commands:**\n\n"
-            "/start - Start the bot\n"
-            "/help - Show this help message\n"
-            "/status - Show current bot status and active trades\n"
+            "/status - Show bot status\n"
             "/settings - Show current settings\n"
-            "/toggle_autotrade - Enable/disable auto-trading\n"
-            "/set_buy_amount <amount> - Set buy amount in SOL\n"
-            "/set_target_multiplier <multiplier> - Set target profit multiplier\n"
-            "/set_sell_percentage <percentage> - Set sell percentage at target\n"
+            "/trades - Show active trades\n"
+            "/enable - Enable auto-trading\n"
+            "/disable - Disable auto-trading\n"
+            "/setbuy <amount> - Set buy amount in SOL\n"
+            "/settarget <multiplier> - Set target profit multiplier\n"
+            "/setsell <percentage> - Set sell percentage at target"
         )
         
-        await event.respond(help_message)
-        logger.info(f"Sent help message to user {user.id}")
+        await self.send_message(
+            event.chat_id,
+            help_message
+        )
     
-    async def _status_command(self, event):
-        """Handle /status command."""
-        user = await event.get_sender()
+    async def handle_status(self, event):
+        """
+        Handle /status command.
         
-        # Only respond to admin
-        if user.id != self.admin_id:
-            return
-        
+        Args:
+            event: Telegram event
+        """
         if not self.trader:
-            await event.respond("⚠️ Trader not initialized")
+            await self.send_message(
+                event.chat_id,
+                "❌ Trader component not initialized"
+            )
             return
         
-        # Get status from trader
-        auto_trade_status = "Enabled ✅" if self.trader.auto_trade_enabled else "Disabled ❌"
-        active_trades = self.trader.get_active_trades()
+        # Get wallet balance
+        sol_balance = await self.trader.wallet.get_sol_balance()
         
-        status_message = f"📊 **Bot Status**\n\n"
-        status_message += f"**Auto-Trading:** {auto_trade_status}\n"
-        status_message += f"**Buy Amount:** {self.trader.buy_amount} SOL\n"
-        status_message += f"**Target Multiplier:** {self.trader.target_multiplier}x\n"
-        status_message += f"**Sell Percentage:** {self.trader.sell_percentage}%\n\n"
+        # Get active trades count
+        active_trades = len(self.trader.active_trades)
         
-        if active_trades:
-            status_message += "**Active Trades:**\n"
-            for trade in active_trades:
-                status_message += f"- {trade['symbol']}: {trade['current_value']} SOL ({trade['profit_percentage']}%)\n"
-        else:
-            status_message += "**No active trades**\n"
+        # Get auto-trade status
+        auto_trade_status = "Enabled" if self.trader.auto_trade_enabled else "Disabled"
         
-        await event.respond(status_message)
-        logger.info(f"Sent status message to user {user.id}")
-    
-    async def _settings_command(self, event):
-        """Handle /settings command."""
-        user = await event.get_sender()
+        # Get monitored groups count
+        groups_count = 0
+        if self.user_client:
+            groups = await self.user_client.get_dialogs()
+            groups_count = sum(1 for g in groups if hasattr(g.entity, 'title') and g.entity.title)
         
-        # Only respond to admin
-        if user.id != self.admin_id:
-            return
+        status_message = (
+            "📊 **Bot Status:**\n\n"
+            f"🔹 Auto-Trading: **{auto_trade_status}**\n"
+            f"🔹 SOL Balance: **{sol_balance:.4f} SOL**\n"
+            f"🔹 Active Trades: **{active_trades}**\n"
+            f"🔹 Monitoring: **{groups_count} Telegram groups**\n"
+        )
         
-        if not self.trader:
-            await event.respond("⚠️ Trader not initialized")
-            return
-        
-        # Create settings message with buttons
-        auto_trade_status = "Enabled ✅" if self.trader.auto_trade_enabled else "Disabled ❌"
-        
-        settings_message = f"⚙️ **Bot Settings**\n\n"
-        settings_message += f"**Auto-Trading:** {auto_trade_status}\n"
-        settings_message += f"**Buy Amount:** {self.trader.buy_amount} SOL\n"
-        settings_message += f"**Target Multiplier:** {self.trader.target_multiplier}x\n"
-        settings_message += f"**Sell Percentage:** {self.trader.sell_percentage}%\n"
-        
+        # Add buttons
         buttons = [
-            [Button.inline("Toggle Auto-Trade", data="toggle_autotrade")],
             [
-                Button.inline("Buy Amount", data="set_buy_amount"),
-                Button.inline("Target Multiplier", data="set_target_multiplier")
+                Button.inline("Enable Auto-Trade" if not self.trader.auto_trade_enabled else "Disable Auto-Trade", 
+                             data="toggle_auto_trade")
             ],
-            [Button.inline("Sell Percentage", data="set_sell_percentage")]
+            [
+                Button.inline("View Settings", data="view_settings"),
+                Button.inline("View Trades", data="view_trades")
+            ]
         ]
         
-        await event.respond(settings_message, buttons=buttons)
-        logger.info(f"Sent settings message to user {user.id}")
+        await self.send_message(
+            event.chat_id,
+            status_message,
+            buttons=buttons
+        )
     
-    async def _toggle_autotrade_command(self, event):
-        """Handle /toggle_autotrade command."""
-        user = await event.get_sender()
+    async def handle_settings(self, event):
+        """
+        Handle /settings command.
         
-        # Only respond to admin
-        if user.id != self.admin_id:
-            return
-        
+        Args:
+            event: Telegram event
+        """
         if not self.trader:
-            await event.respond("⚠️ Trader not initialized")
+            await self.send_message(
+                event.chat_id,
+                "❌ Trader component not initialized"
+            )
             return
         
-        # Toggle auto-trade
-        self.trader.auto_trade_enabled = not self.trader.auto_trade_enabled
-        status = "enabled" if self.trader.auto_trade_enabled else "disabled"
+        settings_message = (
+            "⚙️ **Current Settings:**\n\n"
+            f"🔹 Auto-Trading: **{'Enabled' if self.trader.auto_trade_enabled else 'Disabled'}**\n"
+            f"🔹 Buy Amount: **{self.trader.buy_amount} SOL**\n"
+            f"🔹 Target Multiplier: **{self.trader.target_multiplier}x**\n"
+            f"🔹 Sell Percentage: **{self.trader.sell_percentage}%**\n"
+        )
         
-        await event.respond(f"🔄 Auto-trading {status}")
-        logger.info(f"Auto-trading {status} by user {user.id}")
+        # Add buttons
+        buttons = [
+            [
+                Button.inline("Set Buy Amount", data="set_buy"),
+                Button.inline("Set Target", data="set_target")
+            ],
+            [
+                Button.inline("Set Sell %", data="set_sell"),
+                Button.inline("Toggle Auto-Trade", data="toggle_auto_trade")
+            ]
+        ]
+        
+        await self.send_message(
+            event.chat_id,
+            settings_message,
+            buttons=buttons
+        )
     
-    async def _set_buy_amount_command(self, event):
-        """Handle /set_buy_amount command."""
-        user = await event.get_sender()
+    async def handle_trades(self, event):
+        """
+        Handle /trades command.
         
-        # Only respond to admin
-        if user.id != self.admin_id:
-            return
-        
+        Args:
+            event: Telegram event
+        """
         if not self.trader:
-            await event.respond("⚠️ Trader not initialized")
+            await self.send_message(
+                event.chat_id,
+                "❌ Trader component not initialized"
+            )
             return
         
-        # Get amount from message
+        active_trades = self.trader.get_active_trades()
+        
+        if not active_trades:
+            await self.send_message(
+                event.chat_id,
+                "📈 **Active Trades:**\n\nNo active trades at the moment."
+            )
+            return
+        
+        trades_message = "📈 **Active Trades:**\n\n"
+        
+        for i, trade in enumerate(active_trades, 1):
+            trades_message += (
+                f"**{i}. {trade['symbol']}**\n"
+                f"🔹 Amount: {trade['amount']:.4f}\n"
+                f"🔹 Current Value: {trade['current_value']:.4f} SOL\n"
+                f"🔹 Profit: {trade['profit_percentage']:.2f}%\n\n"
+            )
+        
+        await self.send_message(
+            event.chat_id,
+            trades_message
+        )
+    
+    async def handle_enable(self, event):
+        """
+        Handle /enable command.
+        
+        Args:
+            event: Telegram event
+        """
+        if not self.trader:
+            await self.send_message(
+                event.chat_id,
+                "❌ Trader component not initialized"
+            )
+            return
+        
+        self.trader.set_auto_trade_enabled(True)
+        
+        await self.send_message(
+            event.chat_id,
+            "✅ Auto-trading has been **enabled**."
+        )
+    
+    async def handle_disable(self, event):
+        """
+        Handle /disable command.
+        
+        Args:
+            event: Telegram event
+        """
+        if not self.trader:
+            await self.send_message(
+                event.chat_id,
+                "❌ Trader component not initialized"
+            )
+            return
+        
+        self.trader.set_auto_trade_enabled(False)
+        
+        await self.send_message(
+            event.chat_id,
+            "❌ Auto-trading has been **disabled**."
+        )
+    
+    async def handle_set_buy(self, event):
+        """
+        Handle /setbuy command.
+        
+        Args:
+            event: Telegram event
+        """
+        if not self.trader:
+            await self.send_message(
+                event.chat_id,
+                "❌ Trader component not initialized"
+            )
+            return
+        
         try:
-            amount = float(event.message.text.split(' ')[1])
-            if amount <= 0:
-                raise ValueError("Amount must be positive")
+            # Extract amount from command
+            command = event.raw_text.split()
             
-            self.trader.buy_amount = amount
-            await event.respond(f"💰 Buy amount set to {amount} SOL")
-            logger.info(f"Buy amount set to {amount} SOL by user {user.id}")
-        except (IndexError, ValueError) as e:
-            await event.respond("⚠️ Invalid amount. Usage: /set_buy_amount <amount>")
-            logger.error(f"Invalid buy amount: {str(e)}")
-    
-    async def _set_target_multiplier_command(self, event):
-        """Handle /set_target_multiplier command."""
-        user = await event.get_sender()
-        
-        # Only respond to admin
-        if user.id != self.admin_id:
-            return
-        
-        if not self.trader:
-            await event.respond("⚠️ Trader not initialized")
-            return
-        
-        # Get multiplier from message
-        try:
-            multiplier = float(event.message.text.split(' ')[1])
-            if multiplier <= 1:
-                raise ValueError("Multiplier must be greater than 1")
-            
-            self.trader.target_multiplier = multiplier
-            await event.respond(f"🎯 Target multiplier set to {multiplier}x")
-            logger.info(f"Target multiplier set to {multiplier}x by user {user.id}")
-        except (IndexError, ValueError) as e:
-            await event.respond("⚠️ Invalid multiplier. Usage: /set_target_multiplier <multiplier>")
-            logger.error(f"Invalid target multiplier: {str(e)}")
-    
-    async def _set_sell_percentage_command(self, event):
-        """Handle /set_sell_percentage command."""
-        user = await event.get_sender()
-        
-        # Only respond to admin
-        if user.id != self.admin_id:
-            return
-        
-        if not self.trader:
-            await event.respond("⚠️ Trader not initialized")
-            return
-        
-        # Get percentage from message
-        try:
-            percentage = float(event.message.text.split(' ')[1])
-            if percentage <= 0 or percentage > 100:
-                raise ValueError("Percentage must be between 0 and 100")
-            
-            self.trader.sell_percentage = percentage
-            await event.respond(f"📊 Sell percentage set to {percentage}%")
-            logger.info(f"Sell percentage set to {percentage}% by user {user.id}")
-        except (IndexError, ValueError) as e:
-            await event.respond("⚠️ Invalid percentage. Usage: /set_sell_percentage <percentage>")
-            logger.error(f"Invalid sell percentage: {str(e)}")
-    
-    async def _button_callback(self, event):
-        """Handle button callbacks."""
-        user = await event.get_sender()
-        
-        # Only respond to admin
-        if user.id != self.admin_id:
-            return
-        
-        data = event.data.decode('utf-8')
-        logger.info(f"Button callback: {data}")
-        
-        if data == "toggle_autotrade":
-            # Toggle auto-trade
-            if not self.trader:
-                await event.answer("⚠️ Trader not initialized")
+            if len(command) < 2:
+                await self.send_message(
+                    event.chat_id,
+                    "❌ Please specify an amount: /setbuy <amount>"
+                )
                 return
             
-            self.trader.auto_trade_enabled = not self.trader.auto_trade_enabled
-            status = "enabled" if self.trader.auto_trade_enabled else "disabled"
+            amount = float(command[1])
             
-            await event.answer(f"Auto-trading {status}")
-            logger.info(f"Auto-trading {status} by user {user.id}")
+            if amount <= 0:
+                await self.send_message(
+                    event.chat_id,
+                    "❌ Amount must be greater than 0."
+                )
+                return
             
-            # Update settings message
-            await self._settings_command(event)
+            self.trader.set_buy_amount(amount)
+            
+            await self.send_message(
+                event.chat_id,
+                f"✅ Buy amount set to **{amount} SOL**."
+            )
         
-        elif data<response clipped><NOTE>To save on context only part of this file has been shown to you. You should retry this tool after you have searched inside the file with `grep -n` in order to find the line numbers of what you are looking for.</NOTE>
+        except ValueError:
+            await self.send_message(
+                event.chat_id,
+                "❌ Invalid amount. Please specify a valid number."
+            )
+        
+        except Exception as e:
+            logger.error(f"Error handling setbuy command: {str(e)}")
+            await self.send_message(
+                event.chat_id,
+                "❌ An error occurred while setting buy amount."
+            )
+    
+    async def handle_set_target(self, event):
+        """
+        Handle /settarget command.
+        
+        Args:
+            event: Telegram event
+        """
+        if not self.trader:
+            await self.send_message(
+                event.chat_id,
+                "❌ Trader component not initialized"
+            )
+            return
+        
+        try:
+            # Extract multiplier from command
+            command = event.raw_text.split()
+            
+            if len(command) < 2:
+                await self.send_message(
+                    event.chat_id,
+                    "❌ Please specify a multiplier: /settarget <multiplier>"
+                )
+                return
+            
+            multiplier = float(command[1])
+            
+            if multiplier <= 1:
+                await self.send_message(
+                    event.chat_id,
+                    "❌ Multiplier must be greater than 1."
+                )
+                return
+            
+            self.trader.set_target_multiplier(multiplier)
+            
+            await self.send_message(
+                event.chat_id,
+                f"✅ Target multiplier set to **{multiplier}x**."
+            )
+        
+        except ValueError:
+            await self.send_message(
+                event.chat_id,
+                "❌ Invalid multiplier. Please specify a valid number."
+            )
+        
+        except Exception as e:
+            logger.error(f"Error handling settarget command: {str(e)}")
+            await self.send_message(
+                event.chat_id,
+                "❌ An error occurred while setting target multiplier."
+            )
+    
+    async def handle_set_sell(self, event):
+        """
+        Handle /setsell command.
+        
+        Args:
+            event: Telegram event
+        """
+        if not self.trader:
+            await self.send_message(
+                event.chat_id,
+                "❌ Trader component not initialized"
+            )
+            return
+        
+        try:
+            # Extract percentage from command
+            command = event.raw_text.split()
+            
+            if len(command) < 2:
+                await self.send_message(
+                    event.chat_id,
+                    "❌ Please specify a percentage: /setsell <percentage>"
+                )
+                return
+            
+            percentage = float(command[1])
+            
+            if percentage <= 0 or percentage > 100:
+                await self.send_message(
+                    event.chat_id,
+                    "❌ Percentage must be between 0 and 100."
+                )
+                return
+            
+            self.trader.set_sell_percentage(percentage)
+            
+            await self.send_message(
+                event.chat_id,
+                f"✅ Sell percentage set to **{percentage}%**."
+            )
+        
+        except ValueError:
+            await self.send_message(
+                event.chat_id,
+                "❌ Invalid percentage. Please specify a valid number."
+            )
+        
+        except Exception as e:
+            logger.error(f"Error handling setsell command: {str(e)}")
+            await self.send_message(
+                event.chat_id,
+                "❌ An error occurred while setting sell percentage."
+            )
+    
+    async def handle_button(self, event):
+        """
+        Handle button callbacks.
+        
+        Args:
+            event: Telegram event
+        """
+        if not self.trader:
+            await event.answer("Trader component not initialized", alert=True)
+            return
+        
+        try:
+            # Get button data
+            data = event.data.decode("utf-8")
+            
+            if data == "toggle_auto_trade":
+                # Toggle auto-trade
+                new_state = not self.trader.auto_trade_enabled
+                self.trader.set_auto_trade_enabled(new_state)
+                
+                await event.answer(f"Auto-trading {'enabled' if new_state else 'disabled'}")
+                
+                # Update message
+                await self.handle_status(event)
+            
+            elif data == "view_settings":
+                # Show settings
+                await self.handle_settings(event)
+            
+            elif data == "view_trades":
+                # Show trades
+                await self.handle_trades(event)
+            
+            elif data == "set_buy":
+                # Prompt for buy amount
+                await self.send_message(
+                    event.chat_id,
+                    "Please enter buy amount in SOL using /setbuy <amount>"
+                )
+            
+            elif data == "set_target":
+                # Prompt for target multiplier
+                await self.send_message(
+                    event.chat_id,
+                    "Please enter target multiplier using /settarget <multiplier>"
+                )
+            
+            elif data == "set_sell":
+                # Prompt for sell percentage
+                await self.send_message(
+                    event.chat_id,
+                    "Please enter sell percentage using /setsell <percentage>"
+                )
+            
+            elif data.startswith("trade_"):
+                # Handle token trade button
+                token_data = data.split("_")[1:]
+                if len(token_data) >= 2:
+                    symbol = token_data[0]
+                    address = token_data[1]
+                    
+                    # Buy token
+                    success = await self.trader.buy_token(symbol, address)
+                    
+                    if success:
+                        await event.answer(f"Started trading {symbol}")
+                        await self.send_message(
+                            event.chat_id,
+                            f"✅ Successfully started trading **{symbol}**."
+                        )
+                    else:
+                        await event.answer(f"Failed to trade {symbol}")
+                        await self.send_message(
+                            event.chat_id,
+                            f"❌ Failed to start trading **{symbol}**."
+                        )
+                else:
+                    await event.answer("Invalid token data")
+            
+            else:
+                await event.answer("Unknown button")
+        
+        except Exception as e:
+            logger.error(f"Error handling button callback: {str(e)}")
+            await event.answer("An error occurred")
